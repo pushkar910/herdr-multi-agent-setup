@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# lead: launch Claude Code with the Lead orchestrator system prompt appended.
+#
+# Env:
+#   LEAD_PROMPT_FILE      prompt file (default: ~/.claude/lead_prompt.txt)
+#   LEAD_MODEL            model ID (default: claude-opus-5-5); a --model arg wins
+#   LEAD_PERMISSION_MODE  permission mode (default: auto); a --permission-mode or
+#                         --dangerously-skip-permissions arg wins
+#   LEAD_SETTINGS_FILE    extra Claude Code settings, e.g. notification hooks
+#                         (default: ~/.claude/lead/settings.json, used if it exists);
+#                         a --settings arg wins
+#   LEAD_NO_RENAME=1      do not rename the Herdr pane/tab/agent to "lead"
+set -euo pipefail
+
+PROMPT_FILE="${LEAD_PROMPT_FILE:-$HOME/.claude/lead_prompt.txt}"
+MODEL="${LEAD_MODEL:-claude-opus-5-5}"
+PERM="${LEAD_PERMISSION_MODE:-auto}"
+SETTINGS_FILE="${LEAD_SETTINGS_FILE:-$HOME/.claude/lead/settings.json}"
+
+if [ ! -f "$PROMPT_FILE" ]; then
+  echo "lead: prompt file not found: $PROMPT_FILE" >&2
+  echo "lead: run ./install.sh from the herdr-multi-agent-setup repo, or set LEAD_PROMPT_FILE." >&2
+  exit 1
+fi
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "lead: 'claude' (Claude Code CLI) not found on PATH." >&2
+  exit 1
+fi
+
+# has_flag <flag> <args...>: true if <flag> or <flag>=value appears before a bare "--".
+has_flag() {
+  local flag="$1" arg
+  shift
+  for arg in "$@"; do
+    case "$arg" in
+      --) return 1 ;;
+      "$flag" | "$flag"=*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Background helper: Herdr only detects the agent after claude starts, so retry
+# the agent rename once per second for ~30s. If "lead" belongs to another live
+# agent, fall back to lead-2, lead-3, ...
+rename_agent_loop() {
+  local pane="$1" i n name info
+  trap '' HUP
+  for ((i = 0; i < 30; i++)); do
+    n=1
+    while [ "$n" -le 9 ]; do
+      if [ "$n" -eq 1 ]; then name="lead"; else name="lead-$n"; fi
+      if info="$(herdr agent get "$name" 2>/dev/null)"; then
+        case "$info" in
+          *"\"pane_id\":\"$pane\""*) return 0 ;;   # already ours
+        esac
+        n=$((n + 1))                              # taken by another live agent
+        continue
+      fi
+      if herdr agent rename "$pane" "$name" >/dev/null 2>&1; then
+        return 0
+      fi
+      break                                       # agent not detected yet; retry
+    done
+    sleep 1
+  done
+  return 0
+}
+
+# Background: pane rename, tab rename (sole pane only), then the agent loop.
+rename_all() {
+  local pane="$1" tab="$2" tab_json
+  trap '' HUP
+  herdr pane rename "$pane" lead >/dev/null 2>&1 || true
+
+  # Rename the tab only if the Lead is its sole pane, so a split never clobbers
+  # the user's tab label.
+  if [ -n "$tab" ]; then
+    tab_json="$(herdr tab get "$tab" 2>/dev/null || true)"
+    if grep -Eq '"pane_count"[[:space:]]*:[[:space:]]*1([^0-9]|$)' <<< "$tab_json"; then
+      herdr tab rename "$tab" lead >/dev/null 2>&1 || true
+    fi
+  fi
+
+  rename_agent_loop "$pane"
+}
+
+# Best-effort Herdr naming. Never fails or delays the launch: every herdr call
+# runs in a detached background subshell with all output discarded.
+herdr_rename() {
+  [ "${LEAD_NO_RENAME:-0}" = "1" ] && return 0
+  [ "${HERDR_ENV:-}" = "1" ] || return 0
+  [ -n "${HERDR_PANE_ID:-}" ] || return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+
+  ( rename_all "$HERDR_PANE_ID" "${HERDR_TAB_ID:-}" ) </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+herdr_rename || true
+
+extra=()
+has_flag --model "$@" || extra+=(--model "$MODEL")
+if ! has_flag --permission-mode "$@" && ! has_flag --dangerously-skip-permissions "$@"; then
+  extra+=(--permission-mode "$PERM")
+fi
+if [ -f "$SETTINGS_FILE" ] && ! has_flag --settings "$@"; then
+  extra+=(--settings "$SETTINGS_FILE")
+fi
+
+# ${extra[@]+...} keeps bash 3.2 (macOS) happy with an empty array under set -u.
+exec claude --append-system-prompt "$(cat "$PROMPT_FILE")" ${extra[@]+"${extra[@]}"} "$@"

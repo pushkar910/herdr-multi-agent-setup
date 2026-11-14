@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# lead-notify: macOS notification for Lead sessions, run as a Claude Code hook.
+# Usage: lead-notify stop|permission   (hook JSON on stdin)
+#
+# Always exits 0 and never writes to stdout (Claude Code may interpret hook stdout).
+# Env:
+#   LEAD_NOTIFY=0                  disable (no-op)
+#   LEAD_NOTIFY_DEBUG=1            append a log to ~/.claude/lead/notify.log
+#   LEAD_NOTIFY_SOUND_STOP         banner sound for replies (default: Glass; empty = silent)
+#   LEAD_NOTIFY_SOUND_PERMISSION   banner sound for approvals (default: Ping; empty = silent)
+set -u
+
+LOG="$HOME/.claude/lead/notify.log"
+if [ "${LEAD_NOTIFY_DEBUG:-0}" = "1" ] && mkdir -p "${LOG%/*}" 2>/dev/null; then
+  exec >>"$LOG" 2>&1
+else
+  exec >/dev/null 2>&1
+  LOG=""
+fi
+log() { [ -n "$LOG" ] && printf '%s lead-notify[%s]: %s\n' "$(date '+%F %T')" "$$" "$*"; return 0; }
+
+MAX=120
+mode="${1:-}"
+
+# have_python: python3 usable without triggering the macOS developer-tools
+# install dialog (/usr/bin/python3 is only a stub until those tools exist).
+have_python() {
+  local py
+  py="$(command -v python3 2>/dev/null)" || return 1
+  if [ "$py" = "/usr/bin/python3" ]; then
+    /usr/bin/xcode-select -p >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+# Prints cwd, message, notification_type as NUL-terminated fields: whitespace
+# collapsed, message truncated to $MAX characters. Invalid JSON -> empty fields.
+parse_python() {
+  python3 -I -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
+except Exception:
+    d = {}
+if not isinstance(d, dict):
+    d = {}
+def field(k):
+    v = d.get(k)
+    return " ".join(v.replace("\0", " ").split()) if isinstance(v, str) else ""
+msg = field("message")
+max_len = int(sys.argv[1])
+if len(msg) > max_len:
+    msg = msg[: max_len - 1].rstrip() + "…"
+sys.stdout.write(field("cwd") + "\0" + msg + "\0" + field("notification_type") + "\0")
+' "$MAX"
+}
+
+# Fallback without python: plutil reads JSON (fails on null values), then a
+# sed extraction of simple string values. Input is only ever treated as data.
+json_field() {
+  local key="$1" v
+  if v="$(plutil -extract "$key" raw -o - - <<< "$INPUT" 2>/dev/null)"; then
+    printf '%s' "$v"
+    return 0
+  fi
+  v="$(printf '%s' "$INPUT" | tr '\n' ' ' |
+       sed -nE 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)".*/\1/p')"
+  v="${v//\\\"/\"}"
+  v="${v//\\n/ }"
+  v="${v//\\t/ }"
+  v="${v//\\\\/\\}"
+  printf '%s' "$v"
+}
+
+# clean <text>: control characters and whitespace runs -> one space, trimmed.
+clean() {
+  local s
+  s="$(printf '%s' "$1" | tr -s '[:cntrl:][:space:]' ' ')"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+parse_fallback() {
+  local cwd msg ntype LC_ALL=en_US.UTF-8   # character-aware tr and ${msg:0:N}
+  export LC_ALL
+  cwd="$(clean "$(json_field cwd)")"
+  msg="$(clean "$(json_field message)")"
+  ntype="$(clean "$(json_field notification_type)")"
+  if [ "${#msg}" -gt "$MAX" ]; then
+    msg="${msg:0:$((MAX - 1))}…"
+  fi
+  printf '%s\0%s\0%s\0' "$cwd" "$msg" "$ntype"
+}
+
+# notify_macos <title> <body> <sound>: text reaches AppleScript only as argv,
+# never as script source, so quotes or code in the text cannot be executed.
+notify_macos() {
+  osascript - "$1" "$2" "$3" <<'APPLESCRIPT'
+on run argv
+  set theTitle to item 1 of argv
+  set theBody to item 2 of argv
+  set theSound to item 3 of argv
+  if theSound is "" then
+    display notification theBody with title theTitle
+  else
+    display notification theBody with title theTitle sound name theSound
+  end if
+end run
+APPLESCRIPT
+}
+
+main() {
+  [ "${LEAD_NOTIFY:-1}" = "0" ] && { log "disabled (LEAD_NOTIFY=0)"; return 0; }
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || { log "not macOS; skipping"; return 0; }
+
+  local title="Lead" body sound herdr_sound cwd="" msg="" ntype=""
+  case "$mode" in
+    stop)       sound="${LEAD_NOTIFY_SOUND_STOP-Glass}";      herdr_sound="done" ;;
+    permission) sound="${LEAD_NOTIFY_SOUND_PERMISSION-Ping}"; herdr_sound="request" ;;
+    *) log "unknown mode: '$mode'"; return 0 ;;
+  esac
+
+  {
+    IFS= read -r -d '' cwd
+    IFS= read -r -d '' msg
+    IFS= read -r -d '' ntype
+  } < <(
+    if have_python; then
+      printf '%s' "$INPUT" | parse_python
+    else
+      parse_fallback
+    fi 2>/dev/null
+  )
+
+  if [ "$mode" = "permission" ] && [ -n "$ntype" ] && [ "$ntype" != "permission_prompt" ]; then
+    log "ignoring notification_type '$ntype'"
+    return 0
+  fi
+
+  if [ "$mode" = "stop" ]; then
+    body="Lead replied"
+    if [ -n "$cwd" ]; then
+      local dir="$cwd"
+      while [ "$dir" != "/" ] && [ "${dir%/}" != "$dir" ]; do dir="${dir%/}"; done
+      dir="${dir##*/}"
+      body="$body · ${dir:-/}"
+    fi
+  else
+    body="Lead needs your approval"
+    [ -n "$msg" ] && body="$body · $msg"
+  fi
+  log "mode=$mode body=$body"
+
+  # Deliver in the background so the hook returns immediately.
+  if command -v osascript >/dev/null 2>&1; then
+    ( notify_macos "$title" "$body" "$sound" </dev/null; log "osascript exit $?" ) &
+  fi
+  if [ "${HERDR_ENV:-}" = "1" ] && command -v herdr >/dev/null 2>&1; then
+    ( herdr notification show "$title" --body "$body" --sound "$herdr_sound" </dev/null; log "herdr exit $?" ) &
+  fi
+  # Let delivery finish while main is alive (bounded by the cap below).
+  local i
+  for ((i = 0; i < 15; i++)); do
+    [ -z "$(jobs -pr)" ] && break
+    sleep 0.1
+  done
+  return 0
+}
+
+# Read the hook JSON in the foreground (a background job's stdin is /dev/null).
+INPUT=""
+[ -t 0 ] || INPUT="$(cat)"
+
+# Hard cap: the hook returns within ~1.8s even if a parser or osascript is slow
+# (e.g. the first /usr/bin/python3 start); unfinished delivery continues detached.
+main &
+MAIN_PID=$!
+for ((i = 0; i < 18; i++)); do
+  kill -0 "$MAIN_PID" 2>/dev/null || break
+  sleep 0.1
+done
+exit 0
