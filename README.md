@@ -194,22 +194,12 @@ It also removes the `herdr-multi-agent-setup` rc block (and the rc file itself i
 
 Re-installs take a safety backup (`*.bak.<timestamp>`) only when the file holds something of yours: you edited it after the last install, or it was yours before the first install. An unedited file from a previous install is simply replaced. Apart from the one uninstall restores, these stay in place for you to inspect or delete, as do `*.bak.uninstall.*` files and `~/.claude/lead/notify.log` (a directory holding them is kept).
 
-## Migrating from an older ross setup
-
-This project was previously named `herdr-ross-orchestrator`, with an orchestrator called `ross`. The installer does not manage or remove anything from that setup. If you have any of these, remove them by hand:
-
-- `alias ross=...` or `alias hross=...` lines in your `~/.zshrc` / `~/.bashrc`, and an old `# >>> herdr-ross >>>` block;
-- `~/.local/bin/ross`, `~/.local/bin/ross-notify`, `~/.claude/ross_prompt.txt`, and `~/.claude/ross/`;
-- a `command = "ross"` binding in `~/.config/herdr/config.toml` (this installer replaces that file with one bound to `lead`, after backing it up).
-
-If the old setup was installed with its own `uninstall.sh`, run that from the old checkout first instead.
-
 ## Troubleshooting
 
 - **`lead: prompt file not found`**: run `./install.sh`, or set `LEAD_PROMPT_FILE`.
 - **`lead: 'claude' ... not found on PATH`**: install Claude Code and make sure its binary is on `PATH`.
 - **`lead` or `hlead` not found**: run `source ~/.zshrc` (or `~/.bashrc`), or open a new terminal. Check that `~/.local/bin` is on `PATH`.
-- **`lead` runs something else**: an `alias lead=` in your rc file shadows the launcher. Remove it (`type lead` shows what runs). See also [Migrating from an older ross setup](#migrating-from-an-older-ross-setup).
+- **`lead` runs something else**: an `alias lead=` in your rc file shadows the launcher. Remove it (`type lead` shows what runs).
 - **`Ctrl+b r` does nothing**: the config was not loaded. Run `herdr server reload-config`, or restart Herdr.
 - **A sub-agent is stuck `blocked`**: it is waiting on a permission dialog. Approve or deny it in that agent's tab, or ask the Lead to restart it with a different `--permission-mode`.
 - **No notification banners**: allow Script Editor in System Settings → Notifications, check Focus/Do Not Disturb, check `LEAD_NOTIFY` is not `0`, then run the test commands in [Notifications](#notifications-macos) with `LEAD_NOTIFY_DEBUG=1` and read `~/.claude/lead/notify.log`. In a Lead session, `/hooks` lists the loaded hooks.
